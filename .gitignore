@@ -1,0 +1,56 @@
+# ── Generated output (changes every run) ─────────────────────────────────────
+output/
+ScriptLatest/output/
+final_ab_experiment_*
+ab_experiment_*.csv
+ab_experiment_*.html
+ab_experiment_report_*.csv
+ab_experiment_report_*.html
+ab_experiment_dashboard_*.html
+ab_results.csv
+ab_results.json
+ab_dashboard.html
+results.html
+
+# ── ML model weights & data (huge binary files) ───────────────────────────────
+ScriptLatest/BertDownload/
+ScriptLatest/DebertaLarge/
+ScriptLatest/hf_model_download/
+ScriptLatest/huggingface/
+ScriptLatest/models/
+ScriptLatest/nltk_data/
+nltk_data/
+
+# ── Python cache & bytecode ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── DeepEval / VibeCheck / IDE internals ─────────────────────────────────────
+.deepeval/
+ScriptLatest/.deepeval/
+.vibecheck/
+.claude/
+.islstudio/
+
+# ── PowerPoint output files ───────────────────────────────────────────────────
+*.pptx
+
+# ── Exported data / spreadsheets ─────────────────────────────────────────────
+*.xlsx
+test_cases.csv
+test_cycles.csv
+test_plans.csv
+
+# ── Secrets (NEVER commit these) ─────────────────────────────────────────────
+.env
+*.env
+secrets.txt
+
+# ── Local scratch files ───────────────────────────────────────────────────────
+inputs.txt
+Zomato.txt
+OpenAIEntities.txt
+Summary.txt
