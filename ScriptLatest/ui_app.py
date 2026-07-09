@@ -26,6 +26,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 
 st.set_page_config(
@@ -179,9 +180,9 @@ section[data-testid="stSidebar"] .sb-title{ font-size:.78rem; letter-spacing:.12
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
 
-@st.cache_resource(show_spinner="Loading NLP models...")
+@st.cache_resource(show_spinner="Initializing backend runtime...")
 def load_backend():
-    """Import the backend module ONCE and load the heavy NLP models.
+    """Import the backend module once (heavy NLP models are lazy-loaded).
 
     The provider/API-key/URL are NOT baked in here — the backend's module-level
     init is resilient and we (re)configure the LLM client afterwards via
@@ -190,6 +191,8 @@ def load_backend():
     """
     # A placeholder so the resilient backend init never blocks on input().
     os.environ.setdefault("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "") or "sk-ui-placeholder")
+    # PERF: Avoid import-time provider/model-list network calls in UI mode.
+    os.environ["AB_SKIP_AUTO_LLM_INIT"] = "1"
     backend_path = (SCRIPT_DIR / "ABExperimentFixes.py").resolve()
     spec = importlib.util.spec_from_file_location(
         "ab_backend", str(backend_path)
@@ -209,6 +212,23 @@ def load_backend():
         os.chdir(old_cwd)
         builtins.input = _real
     return mod
+
+@st.cache_resource
+def _nlp_warmup_executor():
+    """Single shared worker to warm NLP models without blocking the UI."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="ab-nlp-warmup")
+
+def start_nlp_warmup(backend_module):
+    """Kick off backend NLP warmup in the background (idempotent)."""
+    if backend_module is None or not hasattr(backend_module, "ensure_models_loaded"):
+        return
+    if bool(getattr(backend_module, "MODELS", {}).get("_loaded")):
+        return
+    _fut = st.session_state.get("_nlp_warmup_future")
+    if _fut is None or _fut.done():
+        st.session_state["_nlp_warmup_future"] = _nlp_warmup_executor().submit(
+            backend_module.ensure_models_loaded
+        )
 
 # ---------------------------------------------------------------------------
 # Scoring helpers
@@ -260,6 +280,7 @@ _defaults = dict(
     llm_selected_model_role="Model A",
     llm_compare_depth="Fast",
     llm_judge_enabled=False,                    # toggle the (paid) LLM-judge call
+    _nlp_warmup_future=None,
 )
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -329,40 +350,73 @@ with st.sidebar:
 
     if st.button("Connect & Load Models", type="primary", use_container_width=True):
         provider_id = "portkey" if is_portkey else "openai"
-        with st.spinner("Connecting..."):
-            try:
-                st.session_state.api_key = key_in
-                # NLP models load once and stay cached; only the lightweight
-                # LLM client + model list is (re)configured per connect.
-                be = load_backend()
-                if provider_id == "portkey":
-                    ok, err, models = be.configure_llm_provider(
-                        provider="portkey",
-                        api_key=key_in,
-                        base_url=(url_in or None),
-                        portkey_api_key=key_in,
-                    )
-                else:
-                    ok, err, models = be.configure_llm_provider(
-                        provider="openai",
-                        api_key=key_in,
-                        base_url=(url_in or None),
-                    )
-                if ok:
-                    st.session_state.backend = be
-                    st.session_state.valid_models = models
-                    st.success(
-                        f"Connected to {provider_label} · {len(models)} models loaded"
-                    )
-                    st.rerun()
-                else:
-                    st.session_state.backend = None
-                    st.session_state.valid_models = models or []
-                    st.error(f"Could not connect to {provider_label}: {err}")
-            except Exception as e:
-                st.error(f"Failed: {e}")
-                with st.expander("Show technical details", expanded=False):
-                    st.code(traceback.format_exc(), language="text")
+
+        # PERF: Skip the expensive models.list() API call if the key + provider
+        # + URL haven't changed since the last successful connect. The NLP models
+        # are already cached by @st.cache_resource; this short-circuits the only
+        # remaining network round-trip on "reconnect with same key".
+        _cache_key = f"{provider_id}|{key_in}|{url_in}"
+        _already_connected = (
+            st.session_state.get("backend") is not None
+            and st.session_state.get("_connect_cache_key") == _cache_key
+            and st.session_state.get("valid_models")
+        )
+        if _already_connected:
+            be = st.session_state.get("backend")
+            start_nlp_warmup(be)
+            st.success(
+                f"Already connected to {provider_label} · "
+                f"{len(st.session_state.valid_models)} models (cached — key unchanged)"
+            )
+        else:
+            with st.spinner("Step 1/2 — Initializing backend runtime..."):
+                try:
+                    st.session_state.api_key = key_in
+                    # Import backend quickly; NLP models are warmed in background.
+                    be = load_backend()
+                except Exception as e:
+                    st.error(f"Failed to initialize backend: {e}")
+                    with st.expander("Show technical details", expanded=False):
+                        st.code(traceback.format_exc(), language="text")
+                    be = None
+
+            if be is not None:
+                with st.spinner(f"Step 2/2 — Connecting to {provider_label} and fetching model list..."):
+                    try:
+                        if provider_id == "portkey":
+                            ok, err, models = be.configure_llm_provider(
+                                provider="portkey",
+                                api_key=key_in,
+                                base_url=(url_in or None),
+                                portkey_api_key=key_in,
+                            )
+                        else:
+                            ok, err, models = be.configure_llm_provider(
+                                provider="openai",
+                                api_key=key_in,
+                                base_url=(url_in or None),
+                            )
+                        if ok:
+                            st.session_state.backend = be
+                            st.session_state.valid_models = models
+                            start_nlp_warmup(be)
+                            # Cache the connection fingerprint to skip redundant
+                            # reconnects when the user clicks again with same key.
+                            st.session_state["_connect_cache_key"] = _cache_key
+                            st.success(
+                                f"Connected to {provider_label} · {len(models)} models loaded "
+                                "· NLP warmup running in background"
+                            )
+                            st.rerun()
+                        else:
+                            st.session_state.backend = None
+                            st.session_state.valid_models = models or []
+                            st.session_state.pop("_connect_cache_key", None)
+                            st.error(f"Could not connect to {provider_label}: {err}")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+                        with st.expander("Show technical details", expanded=False):
+                            st.code(traceback.format_exc(), language="text")
 
     if st.session_state.valid_models:
         st.markdown("<div class='sb-title' style='margin-top:1rem'>Available Models</div>", unsafe_allow_html=True)
@@ -373,9 +427,25 @@ with st.sidebar:
     st.markdown("<div class='sb-title' style='margin-top:1rem'>NLP Components</div>", unsafe_allow_html=True)
     if st.session_state.backend:
         mo = st.session_state.backend.MODELS
+        _loading = bool(mo.get("_loading"))
+        _loaded = bool(mo.get("_loaded"))
+        if _loading:
+            st.caption("Warmup in progress... You can configure settings while models load.")
+        elif _loaded:
+            _secs = mo.get("_load_seconds")
+            if _secs is not None:
+                st.caption(f"Warmup complete in {_secs}s.")
+        else:
+            st.caption("Warmup pending. It starts right after connect.")
+
         def _pill(name, ok):
             cls = "ok" if ok else "warn"
-            txt = "Loaded" if ok else "Fallback"
+            if ok:
+                txt = "Loaded"
+            elif not _loaded:
+                txt = "Pending"
+            else:
+                txt = "Fallback"
             return f"<div style='margin:.18rem 0'><span class='sb-pill {cls}'><span class='dot'></span>{name}: {txt}</span></div>"
         st.markdown(
             _pill("SpaCy",    bool(mo.get("nlp"))) +
@@ -448,6 +518,668 @@ for n, label, sub, done in steps:
     )
 step_html += "</div>"
 st.markdown(step_html, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Shared metric rendering helper — used by both Results and Dashboard tabs
+# ---------------------------------------------------------------------------
+def _render_metric_section(res):
+    """Render all evaluation metric components and formulas for a result set.
+
+    Covers: winner banner, run-mode banner, per-model accuracy/relevancy/
+    effectiveness breakdown (with exact formulas and sub-scores), LLM
+    comparison metrics (Overall Score step-by-step, LLM-as-Judge, Factual,
+    Semantic, Length, ROUGE), entity extraction details, and the full
+    comparison table.  Identical output is produced whether this is called
+    from the Results tab or the Dashboard tab.
+    """
+    if not res:
+        return
+
+    # ── Freshness caption ──────────────────────────────────────────────────
+    _res_ts = res[0].get("Timestamp", "—")
+    _score_chips = " · ".join(
+        f"{r.get('Model')}: A {r.get('Accuracy')} / R {r.get('Relevance')} / E {r.get('Effectiveness')}"
+        for r in res if r.get("Model")
+    )
+    st.caption(f"Run `{_res_ts}` — {_score_chips}")
+
+    # ── Run-mode banner ────────────────────────────────────────────────────
+    _mode_cmp = next((r.get("LLM_Comparison") for r in res if r.get("LLM_Comparison")), None)
+    if _mode_cmp:
+        _run_depth  = _mode_cmp.get("comparison_depth", "Fast")
+        _run_tab    = _mode_cmp.get("run_mode") or "fast"
+        _md_mode    = _mode_cmp.get("metric_details") or {}
+        _skipped    = _md_mode.get("skipped_signals") or []
+        _enabled    = _md_mode.get("enabled_signals") or []
+        _is_full    = _run_depth == "Full audit"
+        if _is_full:
+            _judge_calls = "×2 (position-bias corrected)" if _run_tab == "full" else "×1"
+            _mode_html = (
+                "<div style='border:1px solid rgba(34,197,94,.35); border-radius:10px; "
+                "padding:10px 14px; margin:0 0 12px 0; "
+                "background:linear-gradient(180deg,rgba(34,197,94,.08),rgba(34,197,94,.02));'>"
+                "<div style='font-weight:700; margin-bottom:.25rem;'>🔍 Full Audit Mode — all metrics active</div>"
+                "<div style='font-size:.86rem; opacity:.9;'>"
+                f"LLM-as-Judge {_judge_calls} · DeepEval pair alignment · "
+                "Source faithfulness scoring · NLI factual consistency · "
+                "Semantic embedding cosine · ROUGE-L"
+                "</div>"
+                f"{'<div style=\"font-size:.82rem;opacity:.7;margin-top:.3rem;\">Active signals: ' + ', '.join(_enabled) + '</div>' if _enabled else ''}"
+                "</div>"
+            )
+        else:
+            _skipped_txt = ", ".join(_skipped) if _skipped else "none"
+            _enabled_txt = ", ".join(_enabled) if _enabled else "unknown"
+            _mode_html = (
+                "<div style='border:1px solid rgba(99,102,241,.35); border-radius:10px; "
+                "padding:10px 14px; margin:0 0 12px 0; "
+                "background:linear-gradient(180deg,rgba(99,102,241,.08),rgba(99,102,241,.02));'>"
+                "<div style='font-weight:700; margin-bottom:.25rem;'>⚡ Fast Mode — lightweight metric set</div>"
+                "<div style='font-size:.86rem; opacity:.9;'>"
+                f"Active: {_enabled_txt}"
+                "</div>"
+                f"<div style='font-size:.83rem; opacity:.75; margin-top:.3rem;'>"
+                f"Skipped (switch to Full Audit to enable): {_skipped_txt}"
+                "</div>"
+                "</div>"
+            )
+        st.markdown(_mode_html, unsafe_allow_html=True)
+
+    # ── Winner banner ──────────────────────────────────────────────────────
+    if len(res) >= 2:
+        win = max(res, key=lambda r: r.get("Effectiveness", 0))
+        los = [r for r in res if r["Model"] != win["Model"]][0]
+        mg  = win["Effectiveness"] - los["Effectiveness"]
+        st.markdown(
+            f"<div class='winner-box'>"
+            f"<span class='crown'>Winner</span>"
+            f"<span style='font-size:1.25rem'>{win['Model']}</span>"
+            f"<span style='opacity:.8;margin:0 .55rem'>·</span>"
+            f"<span>Effectiveness {win['Effectiveness']:.2f}/5</span>"
+            f"<span class='margin'>+{mg:.2f} over {los['Model']}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Per-model metric breakdown ─────────────────────────────────────────
+    section_header(
+        "Per-Model Metric Breakdown",
+        "Exact formulas and sub-scores for Accuracy, Relevancy, and Effectiveness.",
+    )
+    cols = st.columns(len(res))
+    for col, r in zip(cols, res):
+        with col:
+            hc   = "model-a" if res.index(r) == 0 else "model-b"
+            is_w = len(res) >= 2 and r["Model"] == max(res, key=lambda x: x.get("Effectiveness", 0))["Model"]
+            badge_pill = (
+                "<span class='pill' style='background:rgba(34,197,94,.18);color:#86efac'>Winner</span>"
+                if is_w else ""
+            )
+            st.markdown(
+                f'<div class="model-header {hc}">{r["Model"]} {badge_pill}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                badge("Accuracy",      r.get("Accuracy")) +
+                badge("Relevancy",     r.get("Relevance")) +
+                badge("Effectiveness", r.get("Effectiveness")),
+                unsafe_allow_html=True,
+            )
+
+            _ed = r.get("Eval_Details") or {}
+
+            def _fv(key, places=3, _ed=_ed):
+                v = _ed.get(key)
+                if v is None:
+                    return "—"
+                try:
+                    return f"{float(v):.{places}f}"
+                except (TypeError, ValueError):
+                    return str(v)
+
+            if _ed or r.get("Task") == "summarization":
+                _de_on      = bool(_ed.get("deepeval_enabled"))
+                # Use clear labels that describe HOW scores were computed, not
+                # the run mode. "Full Audit (DeepEval)" was confusing because it
+                # looked like the run-mode banner — users thought they were in
+                # Full Audit even when they selected Fast in the Run tab.
+                _mode_label = "Scored with DeepEval" if _de_on else "Scored with local NLP"
+                _mode_color = "rgba(34,197,94,.35)" if _de_on else "rgba(96,165,250,.35)"
+                _mode_bg    = "rgba(34,197,94,.06)" if _de_on else "rgba(96,165,250,.06)"
+                _mode_txt   = "#86efac" if _de_on else "#93c5fd"
+
+                with st.expander("Metric Breakdown — how these scores were computed", expanded=True):
+                    st.markdown(
+                        f"<div style='display:inline-block; padding:3px 10px; "
+                        f"border-radius:20px; font-size:.78rem; font-weight:700; "
+                        f"border:1px solid {_mode_color}; background:{_mode_bg}; "
+                        f"color:{_mode_txt}; margin-bottom:10px;'>{_mode_label}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # ── Accuracy ──
+                    st.markdown("##### Accuracy")
+                    _acc_formula = _ed.get("accuracy_formula") or ""
+                    if _acc_formula:
+                        st.code(_acc_formula, language="text")
+                    if _de_on:
+                        _a1, _a2 = st.columns(2)
+                        _a1.metric("alignment_score", _fv("alignment_score"),
+                                   help="DeepEval factual faithfulness (0–1). Fraction of summary claims supported by the source.")
+                        _a2.metric("anonymization_score", _fv("anonymization_score"),
+                                   help="PII / company-name compliance (0–1). +0.05 Bayesian prior before blending.")
+                        _acc_val = _ed.get("accuracy_0_1")
+                        if _acc_val is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"= 5 × [ 0.75 × {_fv('alignment_score')} "
+                                f"+ 0.25 × min(1, {_fv('anonymization_score')} + 0.05) ] "
+                                f"= <b>{_ed.get('accuracy_0_5', '—'):.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        _b1, _b2, _b3 = st.columns(3)
+                        _b1.metric("NLI Consistency", _fv("nli_consistency"),
+                                   help="DeBERTa entailment rate (0–1). Mean p(entailment) across sentence pairs.")
+                        _b2.metric("Hallucination Score", _fv("hallucination_score"),
+                                   help="Local contradiction detector (0–1). 1 = no contradictions.")
+                        _b3.metric("Anonymization Score", _fv("anonymization_score"),
+                                   help="PII compliance (0–1). Carries 0.40 weight in fallback mode.")
+                        _acc_05 = _ed.get("accuracy_0_5")
+                        if _acc_05 is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"= <b>{_acc_05:.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+
+                    st.divider()
+
+                    # ── Relevancy ──
+                    st.markdown("##### Relevancy")
+                    _rel_formula = _ed.get("relevancy_formula") or ""
+                    if _rel_formula:
+                        st.code(_rel_formula, language="text")
+                    _bucket = _ed.get("summary_length_bucket") or "long"
+                    st.caption(f"Summary length bucket: **{_bucket}**")
+
+                    if _bucket == "short":
+                        _sh = _ed.get("short_summary_relevancy") or {}
+                        _sc1, _sc2 = st.columns(2)
+                        _sc1.metric("BERTScore", _fv("bertscore"),
+                                    help="Semantic token-level F1 (0–1).")
+                        _sc2.metric("Sentence Support",
+                                    f"{_sh.get('sentence_support', '—'):.3f}" if _sh.get("sentence_support") is not None else "—",
+                                    help="Mean best cosine match per output sentence against source.")
+                        _sc3, _sc4 = st.columns(2)
+                        _sc3.metric("Embedding Cosine",
+                                    f"{_sh.get('embedding_cosine', '—'):.3f}" if _sh.get("embedding_cosine") is not None else "—",
+                                    help="Dense vector overall meaning alignment (0–1).")
+                        _sc4.metric("Keyphrase Precision",
+                                    f"{_sh.get('keyphrase_precision', '—'):.3f}" if _sh.get("keyphrase_precision") is not None else "—",
+                                    help="Fraction of output TF-IDF phrases also found in source.")
+                        _sc5, _sc6 = st.columns(2)
+                        _sc5.metric("Keypoint Coverage",
+                                    f"{_sh.get('capped_keypoint_coverage', '—'):.3f}" if _sh.get("capped_keypoint_coverage") is not None else "—",
+                                    help="Top-N source keyphrases covered by output (capped at 1.0).")
+                        _sc6.metric("ROUGE F1", _fv("rouge"),
+                                    help="avg(ROUGE-1/2/L F1) — light lexical floor signal.")
+                    elif _de_on:
+                        _rc1, _rc2 = st.columns(2)
+                        _rc1.metric("DeepEval Coverage", _fv("deepeval_coverage_clean"),
+                                    help="Fraction of source key-point questions also answered by summary.")
+                        _rc2.metric("Semantic Blend", _fv("semantic_blend"),
+                                    help="0.55×BERTScore + 0.45×ROUGE. Used when DeepEval coverage = 0.")
+                        _rc3, _rc4 = st.columns(2)
+                        _rc3.metric("BERTScore", _fv("bertscore"),
+                                    help="Semantic token-level F1 (0–1).")
+                        _rc4.metric("ROUGE F1", _fv("rouge"),
+                                    help="avg(ROUGE-1/2/L F1).")
+                        _cov_final = _ed.get("coverage_score")
+                        if _cov_final is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"coverage_score = max(DeepEval, semantic_blend) = <b>{_cov_final:.3f}</b> "
+                                f"→ Relevancy = 5 × {_cov_final:.3f} = <b>{_ed.get('relevancy_0_5', '—'):.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        _lc1, _lc2, _lc3 = st.columns(3)
+                        _lc1.metric("BERTScore", _fv("bertscore"),
+                                    help="Semantic token-level F1 (0–1). Weight: 0.45.")
+                        _lc2.metric("ROUGE F1", _fv("rouge"),
+                                    help="avg(ROUGE-1/2/L F1). Weight: 0.35.")
+                        _lc3.metric("TF-IDF Coverage", "see formula",
+                                    help="Proportion of top TF-IDF reference terms in output. Weight: 0.20.")
+                        _rel_05 = _ed.get("relevancy_0_5")
+                        if _rel_05 is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"= <b>{_rel_05:.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+
+                    st.divider()
+
+                    # ── Effectiveness ──
+                    st.markdown("##### Effectiveness")
+                    _eff_formula = _ed.get("effectiveness_formula") or ""
+                    if _eff_formula:
+                        st.code(_eff_formula, language="text")
+                    _ew     = _ed.get("effectiveness_weights") or {}
+                    _acc_05 = _ed.get("accuracy_0_5")
+                    _rel_05 = _ed.get("relevancy_0_5")
+                    _eff_05 = _ed.get("effectiveness_0_5")
+                    if _acc_05 is not None and _rel_05 is not None and _eff_05 is not None:
+                        _w_acc = _ew.get("accuracy", 0.65)
+                        _w_rel = _ew.get("relevancy", 0.35)
+                        st.markdown(
+                            f"<span style='font-size:.82rem; opacity:.8;'>"
+                            f"= {_w_acc} × {_acc_05:.2f} + {_w_rel} × {_rel_05:.2f} "
+                            f"= <b>{_eff_05:.2f} / 5</b></span>",
+                            unsafe_allow_html=True,
+                        )
+
+                    _de_reason = (_ed.get("deepeval_reason") or "").strip()
+                    if _de_reason:
+                        with st.expander("DeepEval judge reasoning", expanded=False):
+                            st.markdown(_de_reason)
+
+            # ── Cost / latency ──
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Latency", f"{r.get('Latency_s', 'N/A')}s")
+            m2.metric("Tokens",  r.get("Token_Usage", "N/A"))
+            m3.metric("Cost",    f"${r.get('Cost_USD', 0):.4f}")
+            mc1, mc2 = st.columns(2)
+            mc1.metric("Temp",  r.get("Temperature", "N/A"))
+            mc2.metric("Top-P", r.get("Top_P", "N/A"))
+
+            # ── Entity metrics ──
+            if r.get("Entity_F1") is not None:
+                st.markdown("**Entity Metrics**")
+                ea, eb, ec = st.columns(3)
+                ea.metric("Recall",    f"{r.get('Entity_Recall', 0):.3f}")
+                eb.metric("Precision", f"{r.get('Entity_Precision', 0):.3f}")
+                ec.metric("F1",        f"{r.get('Entity_F1', 0):.3f}")
+                st.markdown("**Counts**")
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Gold",  r.get("Entity_Gold_Count", 0))
+                e2.metric("Pred",  r.get("Entity_Pred_Count", 0))
+                e3.metric("TP",    r.get("Entity_TP", 0))
+                e4.metric("FP/FN", f"{r.get('Entity_FP', 0)}/{r.get('Entity_FN', 0)}")
+                with st.expander("Matched entities"):
+                    st.write(", ".join(str(e) for e in (r.get("Matching_Entities") or [])) or "None")
+                with st.expander("Missing (false negatives)"):
+                    st.write(", ".join(str(e) for e in (r.get("Missing_Entities") or [])) or "None")
+                with st.expander("Extra (false positives)"):
+                    st.write(", ".join(str(e) for e in (r.get("Extra_Entities") or [])) or "None")
+
+    # ── LLM Comparison vs Reference ───────────────────────────────────────
+    has_ref_cmp = any(r.get("LLM_Comparison") for r in res)
+    if has_ref_cmp:
+        section_header(
+            "Comparison vs Reference LLM Output",
+            "Each model scored against your reference on four signals: "
+            "LLM-as-Judge quality, factual consistency, semantic similarity, "
+            "and length sanity — folded into an Overall Score (0–100) and a Winner verdict.",
+        )
+
+        def _fmt_num(v, places=3):
+            if v is None:
+                return "—"
+            try:
+                return f"{float(v):.{places}f}"
+            except (TypeError, ValueError):
+                return str(v)
+
+        def _badge_0_1(v, good=0.75, ok=0.5):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return "score-ok"
+            return "score-good" if f >= good else ("score-ok" if f >= ok else "score-poor")
+
+        def _badge_length(ratio):
+            try:
+                r = float(ratio)
+            except (TypeError, ValueError):
+                return "score-ok"
+            if 0.7 <= r <= 1.4:
+                return "score-good"
+            return "score-ok" if 0.5 <= r <= 2.0 else "score-poor"
+
+        # Plain-English guide
+        _first_cmp = next(
+            (r["LLM_Comparison"] for r in res if r.get("LLM_Comparison")), None
+        )
+        _plain_english = (
+            ((_first_cmp or {}).get("metric_details") or {}).get("plain_english") or {}
+        )
+        _pe_to_skipped_key = {
+            "llm_judge":          "llm_as_judge",
+            "faithfulness_source": "independent_vs_source",
+        }
+        _guide_skipped = ((_first_cmp or {}).get("metric_details", {}).get("skipped_signals") or [])
+
+        with st.expander("How to read these metrics · plain-English guide", expanded=False):
+            st.markdown(
+                "Each metric below answers a different question about the model's output. "
+                "Metrics marked **[Skipped — Fast Mode]** were not computed in this run."
+            )
+            for key in [
+                "overall_score", "winner_and_confidence", "llm_judge",
+                "factual_consistency", "semantic_similarity",
+                "faithfulness_source", "length_ratio", "rouge_l",
+            ]:
+                m = _plain_english.get(key)
+                if not m:
+                    continue
+                _sk = _pe_to_skipped_key.get(key)
+                _was_skipped = _sk and _sk in _guide_skipped
+                _bc = "rgba(99,102,241,.25)" if _was_skipped else "rgba(99,102,241,.55)"
+                _bg = "rgba(99,102,241,.02)" if _was_skipped else "rgba(99,102,241,.04)"
+                _op = ".55" if _was_skipped else ".92"
+                _badge_html = (
+                    "<span style='font-size:.72rem;padding:2px 7px;border-radius:10px;"
+                    "background:rgba(99,102,241,.15);color:#a5b4fc;margin-left:.5rem;'>"
+                    "Skipped — Fast Mode</span>"
+                    if _was_skipped else
+                    "<span style='font-size:.72rem;padding:2px 7px;border-radius:10px;"
+                    "background:rgba(34,197,94,.12);color:#86efac;margin-left:.5rem;'>"
+                    "Active</span>"
+                )
+                st.markdown(
+                    f"<div style='border-left:3px solid {_bc}; padding:8px 12px; margin:8px 0;"
+                    f"background:{_bg}; border-radius:6px;'>"
+                    f"<div style='font-weight:700;margin-bottom:.25rem;'>{m['label']}{_badge_html}</div>"
+                    f"<div style='font-size:.88rem;line-height:1.55;opacity:{_op};'>"
+                    f"<b>What it measures:</b> {m['what']}<br>"
+                    f"<b>How it's computed:</b> {m['how']}<br>"
+                    f"<b>What a good score looks like:</b> {m['good']}<br>"
+                    f"<b>What it catches:</b> {m['catches']}</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+        # Per-model comparison cards
+        cmp_models = [r for r in res if r.get("LLM_Comparison")]
+        cmp_cols   = st.columns(len(cmp_models))
+        for col, r in zip(cmp_cols, cmp_models):
+            cmp = r["LLM_Comparison"]
+            with col:
+                hc        = "model-a" if res.index(r) == 0 else "model-b"
+                wc        = cmp.get("winner_card") or {}
+                overall   = cmp.get("overall_score_100")
+                winner    = wc.get("winner") or cmp.get("winner") or "Tie"
+                confidence= wc.get("confidence") or "Low"
+                rationale = wc.get("rationale") or ""
+                st.markdown(
+                    f'<div class="model-header {hc}">{r["Model"]} '
+                    f'<span class="pill">vs Reference</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Overall Score card
+                if overall is not None:
+                    score_cls = _badge_0_1(overall / 100.0, good=0.7, ok=0.5)
+                    delta     = wc.get("delta_100")
+                    delta_txt = f"Δ {delta:+.1f}" if isinstance(delta, (int, float)) else ""
+                    st.markdown(
+                        f"<div style='border:1px solid rgba(255,255,255,.08);border-radius:14px;"
+                        f"padding:14px 16px;margin:6px 0 10px 0;"
+                        f"background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,0));'>"
+                        f"<div style='display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;'>"
+                        f"<span class='score-badge {score_cls}' style='font-size:1.05rem;'>"
+                        f"Overall Score · {overall:.1f}/100</span>"
+                        f"<span class='score-badge score-ok'>Winner: {winner}</span>"
+                        f"<span class='score-badge score-ok'>Confidence: {confidence}</span>"
+                        f"{f'<span class=\"score-badge score-ok\">{delta_txt}</span>' if delta_txt else ''}"
+                        f"</div>"
+                        f"<div style='margin-top:.5rem;opacity:.85;font-size:.92rem;'>{rationale}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Skipped signals notice
+                _cmp_skipped = ((cmp.get("metric_details") or {}).get("skipped_signals") or [])
+                _cmp_depth   = cmp.get("comparison_depth", "Fast")
+                if _cmp_skipped:
+                    _skip_labels = {
+                        "deepeval_alignment":   "DeepEval pair alignment",
+                        "independent_vs_source":"Source faithfulness scoring",
+                        "llm_as_judge":         "LLM-as-Judge",
+                    }
+                    _skip_pretty = ", ".join(_skip_labels.get(s, s) for s in _cmp_skipped)
+                    st.markdown(
+                        f"<div style='font-size:.82rem;opacity:.8;padding:6px 10px;border-radius:7px;"
+                        f"margin:4px 0 8px 0;background:rgba(99,102,241,.08);"
+                        f"border:1px solid rgba(99,102,241,.2);'>"
+                        f"⚡ <b>Fast Mode</b> — skipped: {_skip_pretty}."
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # LLM-as-Judge + Factual Consistency
+                judge       = cmp.get("llm_judge")
+                judge_0_1   = cmp.get("judge_score_0_1")
+                top1, top2  = st.columns(2)
+                if judge_0_1 is not None:
+                    top1.metric("LLM-as-Judge", f"{judge_0_1 * 5:.2f} / 5",
+                                help="Mean of 5 rubric dimensions, position-bias controlled via A/B swap.")
+                else:
+                    top1.metric("LLM-as-Judge", "—",
+                                help="Skipped in Fast Mode. Switch to Full Audit to enable.")
+                top2.metric("Factual Consistency", _fmt_num(cmp.get("factual_score_0_1")),
+                            help="Bidirectional NLI mutual entailment (0–1). 0=unrelated, 1=fully entailed.")
+
+                # Semantic Similarity + Source Faithfulness
+                emb         = cmp.get("embedding") or {}
+                ivs         = cmp.get("independent_vs_source") or {}
+                sa          = (ivs.get("a") or {}) if isinstance(ivs, dict) else {}
+                source_score= sa.get("alignment_0_1") or sa.get("deepeval_score_0_1")
+                sup1, sup2  = st.columns(2)
+                sup1.metric("Semantic Similarity", _fmt_num(emb.get("cosine_0_1")),
+                            help="cos(embed(model), embed(reference)), clamped [0,1].")
+                if source_score is not None:
+                    sup2.metric("Faithfulness · Source", _fmt_num(source_score),
+                                help="How well output preserves facts from the original source.")
+                else:
+                    sup2.metric("Faithfulness · Source", "—",
+                                help="Skipped in Fast Mode or no source provided.")
+
+                # Judge rationale
+                if judge and "error" not in judge:
+                    rationale_text = (judge.get("overall_rationale") or "").strip()
+                    if rationale_text:
+                        st.markdown(
+                            f"<div style='font-size:.88rem;opacity:.8;margin:.25rem 0 .5rem 0;'>"
+                            f"<b>Judge says:</b> {rationale_text}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with st.expander("Judge breakdown · per-dimension scores", expanded=False):
+                        rows = []
+                        for dim, vals in (judge.get("per_dimension") or {}).items():
+                            rows.append({
+                                "Dimension": dim,
+                                "Model (A)": vals.get("a"),
+                                "Reference (B)": vals.get("b"),
+                                "Winner": vals.get("winner"),
+                            })
+                        if rows:
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                        st.caption(
+                            f"Judge model: `{judge.get('_judge_model', '?')}` · "
+                            f"position-bias controlled: {judge.get('_position_bias_controlled', False)}"
+                        )
+
+                # Length + ROUGE diagnostics
+                length    = cmp.get("length") or {}
+                lex       = cmp.get("lexical") or {}
+                ratio     = length.get("length_ratio")
+                ratio_txt = _fmt_num(ratio)
+                ratio_cls = _badge_length(ratio)
+                with st.expander("Diagnostics · length sanity, ROUGE", expanded=False):
+                    d1, d2 = st.columns(2)
+                    d1.markdown(
+                        f"**Length ratio**<br>"
+                        f"<span class='score-badge {ratio_cls}'>{ratio_txt}</span><br>"
+                        f"<span style='font-size:.78rem;opacity:.7;'>"
+                        f"&lt;0.5 truncated · 0.7–1.4 healthy · &gt;2.0 verbose</span>",
+                        unsafe_allow_html=True,
+                    )
+                    d2.metric("ROUGE-L (lexical)", _fmt_num(lex.get("rouge_0_1")),
+                              help="Surface word overlap. Baseline signal for NLP stakeholders.")
+                    st.caption(
+                        f"Model words: {length.get('words_a', '—')} · "
+                        f"Reference words: {length.get('words_b', '—')}"
+                    )
+
+                # ── Overall Score step-by-step formula ───────────────────
+                metric_details    = cmp.get("metric_details") or {}
+                overall_components= cmp.get("overall_components") or {}
+                overall_weights   = cmp.get("overall_weights") or {}
+                overall_score     = cmp.get("overall_score_100")
+                if overall_components:
+                    _expand_score = (_cmp_depth == "Full audit")
+                    with st.expander(
+                        "How the Overall Score was built · step-by-step formulas",
+                        expanded=_expand_score,
+                    ):
+                        _mode_note = (
+                            "Full Audit mode — all four signals contributed."
+                            if _cmp_depth == "Full audit"
+                            else "Fast mode — only signals that ran contributed; weights renormalized."
+                        )
+                        st.markdown(
+                            "Exact math that produced this model's Overall Score. "
+                            f"*{_mode_note}*"
+                        )
+                        signal_friendly = {
+                            "judge":         "LLM-as-Judge quality",
+                            "factual":       "Factual Consistency",
+                            "semantic":      "Semantic Similarity",
+                            "length_sanity": "Length Sanity",
+                        }
+                        # Step 1
+                        st.markdown("**Step 1 — Score each signal (0–1)**")
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "Signal": signal_friendly.get(k, k),
+                                    "Score (0–1)": round(v, 3),
+                                    "Meaning": (
+                                        "Strong" if v >= 0.75
+                                        else "Acceptable" if v >= 0.5
+                                        else "Weak"
+                                    ),
+                                }
+                                for k, v in overall_components.items()
+                            ]),
+                            use_container_width=True, hide_index=True,
+                        )
+                        # Step 2
+                        st.markdown("**Step 2 — Multiply each score by its weight, sum contributions**")
+                        _sum_contrib = 0.0
+                        _sum_weight  = 0.0
+                        _rows2 = []
+                        for k, v in overall_components.items():
+                            w       = overall_weights.get(k) or 0
+                            contrib = round(w * v, 4)
+                            _sum_contrib += contrib
+                            _sum_weight  += w
+                            _rows2.append({
+                                "Signal":         signal_friendly.get(k, k),
+                                "Score":          round(v, 3),
+                                "× Weight":       round(w, 3),
+                                "= Contribution": contrib,
+                            })
+                        _rows2.append({
+                            "Signal":         "TOTAL",
+                            "Score":          "",
+                            "× Weight":       round(_sum_weight, 3),
+                            "= Contribution": round(_sum_contrib, 4),
+                        })
+                        st.dataframe(pd.DataFrame(_rows2), use_container_width=True, hide_index=True)
+                        # Step 3
+                        _avg = _sum_contrib / _sum_weight if _sum_weight else 0
+                        st.markdown("**Step 3 — Divide by total weight and multiply by 100**")
+                        st.code(
+                            f"Overall Score = {_sum_contrib:.4f} ÷ {_sum_weight:.3f} × 100 "
+                            f"= {_avg:.4f} × 100 "
+                            f"= {overall_score if overall_score is not None else round(_avg * 100, 1)}",
+                            language="text",
+                        )
+                        st.caption(
+                            "Dividing by total weight renormalizes the score to 0–100 "
+                            "even when a signal is skipped."
+                        )
+                        # Default weights reference
+                        st.markdown("**Default signal weights (when every signal runs)**")
+                        st.dataframe(
+                            pd.DataFrame([
+                                {"Signal": "LLM-as-Judge quality", "Weight": "45%"},
+                                {"Signal": "Factual Consistency",  "Weight": "30%"},
+                                {"Signal": "Semantic Similarity",  "Weight": "20%"},
+                                {"Signal": "Length Sanity",        "Weight": "5%"},
+                            ]),
+                            use_container_width=True, hide_index=True,
+                        )
+
+                        skipped = metric_details.get("skipped_signals") or []
+                        if skipped:
+                            st.info(
+                                "**Skipped in this run:** " + ", ".join(skipped) +
+                                ". Weights were renormalized over the remaining signals."
+                            )
+
+                        # Advanced / raw formulas
+                        with st.expander("Advanced · raw formulas", expanded=False):
+                            formulas = metric_details.get("formulas") or {}
+                            if formulas:
+                                st.markdown("**Per-signal formulas (technical)**")
+                                for name, formula in formulas.items():
+                                    st.markdown(f"- **{name}:** `{formula}`")
+
+                        for note in metric_details.get("notes") or []:
+                            st.caption(note)
+
+        # ── Cross-model comparison summary ─────────────────────────────────
+        _scored = []
+        for r in cmp_models:
+            cmpx = r.get("LLM_Comparison") or {}
+            _scored.append({
+                "model":   r.get("Model", "?"),
+                "overall": cmpx.get("overall_score_100"),
+                "judge":   cmpx.get("judge_score_0_1"),
+                "factual": cmpx.get("factual_score_0_1"),
+                "semantic":(cmpx.get("embedding") or {}).get("cosine_0_1"),
+                "length":  cmpx.get("length_sanity_0_1"),
+                "wc":      cmpx.get("winner_card") or {},
+            })
+        summary_rows = []
+        for s in _scored:
+            summary_rows.append({
+                "Model":             s["model"],
+                "Overall (0–100)":   s["overall"],
+                "LLM Judge (/5)":    round(s["judge"] * 5, 2) if isinstance(s["judge"], (int, float)) else None,
+                "Factual (0–1)":     s["factual"],
+                "Semantic (0–1)":    s["semantic"],
+                "Length sanity":     s["length"],
+                "Confidence":        (s["wc"].get("confidence") or "—"),
+            })
+        if summary_rows:
+            st.markdown("**Per-model scorecard**")
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # ── Comparison Table ───────────────────────────────────────────────────
+    section_header("Comparison Table", "All numeric metrics side-by-side.")
+    keys = [
+        "Model", "Accuracy", "Relevance", "Effectiveness",
+        "Latency_s", "Token_Usage", "Prompt_Tokens",
+        "Completion_Tokens", "Cost_USD", "Temperature", "Top_P",
+    ]
+    df = pd.DataFrame([{k: r.get(k) for k in keys} for r in res])
+    st.dataframe(df.set_index("Model").T, use_container_width=True)
+
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -714,18 +1446,22 @@ with t_cfg:
 
             judge_col1, judge_col2 = st.columns([3, 2])
             with judge_col1:
+                # LLM judge requires Full Audit run_mode (Run tab selection is
+                # authoritative — llm_compare_depth is now just informational).
+                _judge_needs_full = st.session_state.get("run_mode", "fast") == "full"
                 st.session_state["llm_judge_enabled"] = st.checkbox(
                     "Also run LLM-as-judge pairwise comparison "
                     "(uses your judge model, slightly more cost)",
                     value=(
                         st.session_state.get("llm_judge_enabled", False)
-                        and st.session_state.get("llm_compare_depth") == "Full audit"
+                        and _judge_needs_full
                     ),
                     key="llm_judge_chk",
-                    disabled=st.session_state.get("llm_compare_depth") == "Fast",
+                    disabled=not _judge_needs_full,
                 )
-                if st.session_state.get("llm_compare_depth") == "Fast":
+                if not _judge_needs_full:
                     st.session_state["llm_judge_enabled"] = False
+                    st.caption("Switch to Full Audit in the Run tab to enable LLM-as-judge.")
             with judge_col2:
                 judge_model_default = (
                     getattr(be, "_LLM_JUDGE_DEFAULT_MODEL", None)
@@ -897,6 +1633,66 @@ with t_run:
             unsafe_allow_html=True,
         )
 
+    # ---- Run Mode selector ----
+    section_header(
+        "Run Mode",
+        "Speed/cost knob for the reference-comparison audit only. "
+        "Fast skips expensive LLM-judge and DeepEval pair calls; Full Audit runs "
+        "them all for final reports.",
+    )
+    st.markdown(
+        "<div style='border:1px solid rgba(245,158,11,.35); border-radius:8px; "
+        "padding:8px 12px; margin:0 0 10px 0; "
+        "background:rgba(245,158,11,.08); font-size:.85rem;'>"
+        "<b>Note:</b> Run Mode does <b>not</b> change the per-model "
+        "<b>Accuracy / Relevance / Effectiveness</b> scores. Those are intrinsic "
+        "measures of each model's output and are computed the same way in both "
+        "modes. Run Mode only affects <b>speed/cost</b> and the depth of the "
+        "<i>“Comparison vs Reference LLM Output”</i> section (LLM-as-Judge "
+        "position-bias swap and DeepEval pair-alignment), which appears only when "
+        "you enable <i>“Compare with reference LLM output”</i> on the Configure tab."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    _mode_col1, _mode_col2 = st.columns(2)
+    with _mode_col1:
+        _run_mode = st.radio(
+            "Evaluation depth",
+            ["⚡ Fast (recommended for iteration)", "🔍 Full Audit (for final reports)"],
+            index=0 if st.session_state.get("run_mode", "fast") == "fast" else 1,
+            label_visibility="collapsed",
+            help=(
+                "Affects the reference-comparison audit + speed only — NOT the "
+                "per-model Accuracy/Relevance/Effectiveness.\n\n"
+                "⚡ Fast: skips LLM-judge position-bias swap, halves DeepEval "
+                "coverage questions (5 instead of 10), skips DeepEval pair-alignment. "
+                "~2-3× faster than Full Audit.\n\n"
+                "🔍 Full Audit: all reference-comparison signals, both judge calls, "
+                "n=10 DeepEval questions. Best for final comparison reports."
+            ),
+        )
+        _is_fast = "Fast" in _run_mode
+        st.session_state["run_mode"] = "fast" if _is_fast else "full"
+    with _mode_col2:
+        if _is_fast:
+            st.info(
+                "**⚡ Fast mode active** *(reference-comparison audit only)*\n\n"
+                "- DeepEval coverage: 5 questions (vs 10)\n"
+                "- LLM-judge: 1 call (vs 2, no position-bias swap)\n"
+                "- DeepEval pair-alignment: skipped\n"
+                "- Per-model Accuracy/Relevance/Effectiveness: unchanged\n"
+                "- Est. time: ~30–90s per model"
+            )
+        else:
+            st.warning(
+                "**🔍 Full Audit active** *(reference-comparison audit only)*\n\n"
+                "- DeepEval coverage: 10 questions\n"
+                "- LLM-judge: 2 calls (position-bias corrected)\n"
+                "- DeepEval pair-alignment: enabled\n"
+                "- Per-model Accuracy/Relevance/Effectiveness: unchanged\n"
+                "- Est. time: ~2–5 min per model"
+            )
+
     # ---- Launch ----
     launch_helper = "Both models run in parallel — comparison is fully automated."
     if cfg["task"] == "summarization" and cfg["compare_with_llm"] and cfg["llm_compare_mode"] == "Only one selected model":
@@ -917,6 +1713,27 @@ with t_run:
         import threading
 
         be = st.session_state.backend
+
+        # PERF: Apply the Fast/Full Audit mode selection to the backend at
+        # run time. This lets the user toggle modes without restarting the app.
+        #
+        # run_mode ("fast"/"full") from the Run tab is THE authoritative source.
+        # It overrides llm_compare_depth so that "⚡ Fast" always publishes
+        # "Fast" in the dashboard — no stale Configure-tab setting can override.
+        _fast = st.session_state.get("run_mode", "fast") == "fast"
+        _run_mode_key = "fast" if _fast else "full"
+        # Canonical depth label stored in results JSON and used by dashboards.
+        _effective_depth = "Fast" if _fast else "Full audit"
+        be._AB_FAST_MODE = _fast
+        be._DEEPEVAL_JUDGE_N = 5 if _fast else 10
+        be._LLM_JUDGE_POSITION_BIAS = not _fast  # skip 2nd judge call in fast mode
+        _tlog_mode = (
+            f"Run mode: {_run_mode_key.upper()} "
+            f"(depth={_effective_depth}, "
+            f"deepeval_n={be._DEEPEVAL_JUDGE_N}, "
+            f"judge_position_bias={'on' if be._LLM_JUDGE_POSITION_BIAS else 'off'})"
+        )
+
         st.session_state.running        = True
         st.session_state.results        = []
         st.session_state.log_lines      = []
@@ -938,6 +1755,19 @@ with t_run:
             log_box.code("\n".join(st.session_state.log_lines), language="text")
 
         try:
+            _tlog(_tlog_mode)
+            _tlog("Preparing NLP models...")
+            _flush_logs()
+            if hasattr(be, "ensure_models_loaded"):
+                be.ensure_models_loaded()
+                _secs = be.MODELS.get("_load_seconds")
+                if _secs is not None:
+                    _tlog(f"NLP models ready ({_secs}s warmup)")
+                else:
+                    _tlog("NLP models ready")
+            prog.progress(5)
+            _flush_logs()
+
             task   = cfg["task"]
             m1, m2 = cfg["model1"], cfg["model2"]
             t1, p1 = float(cfg["temp1"]), float(cfg["top_p1"])
@@ -963,7 +1793,14 @@ with t_run:
             _flush_logs()
 
             def _call_and_eval(model, temp, top_p):
-                """Runs entirely in a worker thread — NO Streamlit calls allowed here."""
+                """Runs entirely in a worker thread — NO Streamlit calls allowed here.
+
+                Every run performs a fresh API call + full evaluation. The previous
+                per-model result cache was removed: re-running identical settings
+                returned a stale entry (old scores AND an old Timestamp), which made
+                the Results/Dashboard appear "not updated" and caused output files to
+                overwrite older timestamped files. Correctness beats the ~5-30s saved.
+                """
                 _tlog(f"Calling {model} (temp={temp}, top_p={top_p})...")
                 output, lat, toks, ptoks, ctoks = be.call_openai(
                     model, prompt, max_tokens=mt, temperature=temp, top_p=top_p, num_bullets=nb
@@ -1011,21 +1848,32 @@ with t_run:
                         entry["Eval_Details"] = be.get_summarization_evaluation_details(output, ref)
                         ed = entry["Eval_Details"]
                         if ed.get("deepeval_enabled"):
-                            _tlog(
-                                "  DeepEval | metric.score=%.3f alignment=%.3f "
-                                "coverage=%.3f (raw=%.3f, robust=%.3f, src=%s, bucket=%s)"
-                                % (
-                                    ed.get("deepeval_score") or 0.0,
-                                    ed.get("alignment_score") or 0.0,
-                                    ed.get("coverage_score") or 0.0,
-                                    ed.get("deepeval_raw_coverage") or 0.0,
-                                    ed.get("robust_coverage") or 0.0,
-                                    ed.get("coverage_source") or "n/a",
-                                    ed.get("summary_length_bucket") or "n/a",
+                            _de_score = ed.get("deepeval_score")
+                            if _de_score is not None:
+                                _tlog(
+                                    "  DeepEval | metric.score=%.3f alignment=%.3f "
+                                    "coverage=%.3f (raw=%.3f, robust=%.3f, src=%s, bucket=%s)"
+                                    % (
+                                        _de_score,
+                                        ed.get("alignment_score") or 0.0,
+                                        ed.get("coverage_score") or 0.0,
+                                        ed.get("deepeval_raw_coverage") or 0.0,
+                                        ed.get("robust_coverage") or 0.0,
+                                        ed.get("coverage_source") or "n/a",
+                                        ed.get("summary_length_bucket") or "n/a",
+                                    )
                                 )
-                            )
+                            else:
+                                # DeepEval ran but its judge call failed — show reason
+                                _de_err = getattr(be, "_DEEPEVAL_LAST_ERROR", "") or ""
+                                _tlog(
+                                    f"  DeepEval judge unavailable for {model} — "
+                                    "local fallback metrics used for Accuracy/Relevancy."
+                                    + (f" Reason: {_de_err}" if _de_err else "")
+                                )
                     except Exception as ex:
                         _tlog(f"Eval_Details warning: {ex}")
+
                 return entry
 
             if (
@@ -1069,6 +1917,12 @@ with t_run:
             # stages, so one comparison takes wall-time ~= max(slowest
             # stage) instead of sum(stages). Net speedup vs the original
             # sequential implementation: ~5-7x.
+            #
+            # PERF: Reference text features (BERT embedding + BERTScore
+            # encoding) are precomputed ONCE and cached in session_state
+            # before the parallel comparison loop runs. Without this,
+            # each `_compare_one` call independently encodes the same
+            # reference text — doubling the most expensive NLP work.
             if (
                 task == "summarization"
                 and cfg["compare_with_llm"]
@@ -1080,10 +1934,30 @@ with t_run:
                     f"Comparing {len(results)} model output(s) vs the reference "
                     "LLM output (running in parallel)..."
                 )
-                _flush_logs()
+
                 ref_text = cfg["llm_ref_text"]
                 ref_label = f"Reference ({cfg['llm_ref_source'] or 'pasted'})"
 
+                # Precompute reference text embedding once and cache it.
+                # Both model comparisons reuse this instead of re-encoding.
+                import hashlib as _hl
+                _ref_hash = _hl.md5(ref_text.encode()).hexdigest()[:12]
+                _ref_cache_key = f"_ref_embed_{_ref_hash}"
+                if st.session_state.get(_ref_cache_key) is None:
+                    try:
+                        _ref_embed = be.get_bert_embedding(ref_text, be.MODELS)
+                        st.session_state[_ref_cache_key] = _ref_embed
+                        _tlog(f"  Reference embedding precomputed and cached (hash={_ref_hash})")
+                    except Exception as _emb_err:
+                        _tlog(f"  Reference embedding precompute skipped: {_emb_err}")
+                else:
+                    _tlog(f"  Reference embedding cache hit (hash={_ref_hash}) — skipping recompute")
+
+                _flush_logs()
+
+                # run_mode (Run tab) is authoritative — not llm_compare_depth.
+                # In Fast mode, expensive comparison signals are always skipped.
+                _run_full = not _fast  # closure over _fast from run_experiment
                 def _compare_one(entry):
                     try:
                         return entry, be.compare_two_summaries(
@@ -1092,12 +1966,9 @@ with t_run:
                             source_text=src or None,
                             label_a=entry["Model"],
                             label_b=ref_label,
-                            run_llm_judge=(
-                                cfg["llm_judge_enabled"]
-                                and cfg["llm_compare_depth"] == "Full audit"
-                            ),
-                            run_deepeval_pair=cfg["llm_compare_depth"] == "Full audit",
-                            run_source_score=cfg["llm_compare_depth"] == "Full audit",
+                            run_llm_judge=(_run_full and cfg["llm_judge_enabled"]),
+                            run_deepeval_pair=_run_full,
+                            run_source_score=_run_full,
                         ), None
                     except Exception as cmp_err:
                         return entry, None, cmp_err
@@ -1115,7 +1986,11 @@ with t_run:
                             if cfg["llm_compare_mode"] == "Only one selected model"
                             else "both_models_vs_llm"
                         )
-                        cmp_dict["comparison_depth"] = cfg["llm_compare_depth"]
+                        # Always derive comparison_depth from run_mode so the
+                        # Dashboard banner matches what the user selected in the
+                        # Run tab — never from the stale Configure-tab value.
+                        cmp_dict["comparison_depth"] = _effective_depth
+                        cmp_dict["run_mode"] = _run_mode_key
                         entry["LLM_Comparison"] = cmp_dict
                         entry["Reference_Comparison"] = cmp_dict
                         overall = cmp_dict.get("overall_score_100")
@@ -1153,7 +2028,11 @@ with t_run:
                         "selected_models": selected_models,
                         "model_output_source": "runtime_generated_output",
                         "uses_reference_llm": True,
-                        "comparison_depth": cfg["llm_compare_depth"],
+                        # Always use _effective_depth (derived from run_mode) so
+                        # both the Streamlit banner and the HTML dashboard banner
+                        # reflect the Run tab selection, not a stale Configure value.
+                        "comparison_depth": _effective_depth,
+                        "run_mode": _run_mode_key,
                     }
                 reference_meta = None
                 if task == "summarization" and cfg["compare_with_llm"] and cfg["llm_ref_text"]:
@@ -1223,6 +2102,61 @@ with t_res:
         st.info("Run an experiment first to see results here.")
         st.stop()
 
+    # ---- Freshness marker ----
+    # The Results/Dashboard values come straight from this list, which is
+    # rewritten on every run. Surface the run timestamp + scores so it is
+    # unmistakable whether you are looking at the latest run.
+    _res_ts = res[0].get("Timestamp", "—")
+    _score_chips = " · ".join(
+        f"{r.get('Model')}: A {r.get('Accuracy')} / R {r.get('Relevance')} / E {r.get('Effectiveness')}"
+        for r in res if r.get("Model")
+    )
+    st.caption(f"Showing run `{_res_ts}` — {_score_chips}")
+
+    # ---- Run Mode banner ----
+    # Show prominently what mode was used and which metrics were active/skipped.
+    _mode_cmp = next((r.get("LLM_Comparison") for r in res if r.get("LLM_Comparison")), None)
+    if _mode_cmp:
+        _run_depth  = _mode_cmp.get("comparison_depth", "Fast")
+        _run_tab    = _mode_cmp.get("run_mode") or st.session_state.get("run_mode", "fast")
+        _md_mode    = _mode_cmp.get("metric_details") or {}
+        _skipped    = _md_mode.get("skipped_signals") or []
+        _enabled    = _md_mode.get("enabled_signals") or []
+        _is_full    = _run_depth == "Full audit"
+
+        if _is_full:
+            _judge_calls = "×2 (position-bias corrected)" if _run_tab == "full" else "×1"
+            _mode_html = (
+                "<div style='border:1px solid rgba(34,197,94,.35); border-radius:10px; "
+                "padding:10px 14px; margin:0 0 12px 0; "
+                "background:linear-gradient(180deg,rgba(34,197,94,.08),rgba(34,197,94,.02));'>"
+                "<div style='font-weight:700; margin-bottom:.25rem;'>🔍 Full Audit Mode — all metrics active</div>"
+                "<div style='font-size:.86rem; opacity:.9;'>"
+                f"LLM-as-Judge {_judge_calls} · DeepEval pair alignment · "
+                "Source faithfulness scoring · NLI factual consistency · "
+                "Semantic embedding cosine · ROUGE-L"
+                "</div>"
+                f"{'<div style=\"font-size:.82rem;opacity:.7;margin-top:.3rem;\">Active signals: ' + ', '.join(_enabled) + '</div>' if _enabled else ''}"
+                "</div>"
+            )
+        else:
+            _skipped_txt = ", ".join(_skipped) if _skipped else "none"
+            _enabled_txt = ", ".join(_enabled) if _enabled else "unknown"
+            _mode_html = (
+                "<div style='border:1px solid rgba(99,102,241,.35); border-radius:10px; "
+                "padding:10px 14px; margin:0 0 12px 0; "
+                "background:linear-gradient(180deg,rgba(99,102,241,.08),rgba(99,102,241,.02));'>"
+                "<div style='font-weight:700; margin-bottom:.25rem;'>⚡ Fast Mode — lightweight metric set</div>"
+                "<div style='font-size:.86rem; opacity:.9;'>"
+                f"Active: {_enabled_txt}"
+                "</div>"
+                f"<div style='font-size:.83rem; opacity:.75; margin-top:.3rem;'>"
+                f"Skipped (switch to Full Audit to enable): {_skipped_txt}"
+                "</div>"
+                "</div>"
+            )
+        st.markdown(_mode_html, unsafe_allow_html=True)
+
     # ---- Winner banner ----
     if len(res) >= 2:
         win = max(res, key=lambda r: r.get("Effectiveness", 0))
@@ -1257,6 +2191,181 @@ with t_res:
                 badge("Effectiveness", r.get("Effectiveness")),
                 unsafe_allow_html=True,
             )
+
+            # ---- Metric Breakdown expander (always shown for summarization) --
+            _ed = r.get("Eval_Details") or {}
+            if _ed or r.get("Task") == "summarization":
+                _de_on      = bool(_ed.get("deepeval_enabled"))
+                # Renamed from "Full Audit (DeepEval)" to avoid confusion with
+                # the run-mode banner — deepeval_enabled reflects library
+                # availability, not the Fast/Full Audit run-mode selection.
+                _mode_label = "Scored with DeepEval" if _de_on else "Scored with local NLP"
+                _mode_color = "rgba(34,197,94,.35)" if _de_on else "rgba(96,165,250,.35)"
+                _mode_bg    = "rgba(34,197,94,.06)" if _de_on else "rgba(96,165,250,.06)"
+                _mode_txt   = "#86efac" if _de_on else "#93c5fd"
+
+                def _fv(key, places=3):
+                    v = _ed.get(key)
+                    if v is None:
+                        return "—"
+                    try:
+                        return f"{float(v):.{places}f}"
+                    except (TypeError, ValueError):
+                        return str(v)
+
+                with st.expander("Metric Breakdown — how these scores were computed", expanded=False):
+                    # Mode pill
+                    st.markdown(
+                        f"<div style='display:inline-block; padding:3px 10px; "
+                        f"border-radius:20px; font-size:.78rem; font-weight:700; "
+                        f"border:1px solid {_mode_color}; background:{_mode_bg}; "
+                        f"color:{_mode_txt}; margin-bottom:10px;'>{_mode_label}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # ---- ACCURACY breakdown ----
+                    st.markdown("##### Accuracy")
+                    _acc_formula = _ed.get("accuracy_formula") or ""
+                    if _acc_formula:
+                        st.code(_acc_formula, language="text")
+
+                    if _de_on:
+                        _a1, _a2 = st.columns(2)
+                        _a1.metric(
+                            "alignment_score",
+                            _fv("alignment_score"),
+                            help="DeepEval factual faithfulness (0–1). "
+                                 "Fraction of summary claims supported by the source.",
+                        )
+                        _a2.metric(
+                            "anonymization_score",
+                            _fv("anonymization_score"),
+                            help="PII / company-name compliance (0–1). "
+                                 "+0.05 Bayesian prior applied before blending.",
+                        )
+                        _acc_val = _ed.get("accuracy_0_1")
+                        if _acc_val is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"= 5 × [ 0.75 × {_fv('alignment_score')} "
+                                f"+ 0.25 × min(1, {_fv('anonymization_score')} + 0.05) ] "
+                                f"= <b>{_ed.get('accuracy_0_5', '—'):.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        _b1, _b2, _b3 = st.columns(3)
+                        _fc_val = _ed.get("nli_consistency")
+                        _hd_val = _ed.get("hallucination_score")
+                        _anon   = _ed.get("anonymization_score")
+                        # These sub-values may not be in Eval_Details; show what's available
+                        _b1.metric("NLI Consistency", _fv("nli_consistency"),
+                                   help="DeBERTa entailment rate (0–1). Mean p(entailment) across sentence pairs.")
+                        _b2.metric("Hallucination Score", _fv("hallucination_score"),
+                                   help="Local contradiction detector (0–1). 1 = no contradictions.")
+                        _b3.metric("Anonymization Score", _fv("anonymization_score"),
+                                   help="PII compliance (0–1). Carries 0.40 weight in fallback mode.")
+                        _acc_05 = _ed.get("accuracy_0_5")
+                        if _acc_05 is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"= <b>{_acc_05:.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+
+                    st.divider()
+
+                    # ---- RELEVANCY breakdown ----
+                    st.markdown("##### Relevancy")
+                    _rel_formula = _ed.get("relevancy_formula") or ""
+                    if _rel_formula:
+                        st.code(_rel_formula, language="text")
+
+                    _bucket = _ed.get("summary_length_bucket") or "long"
+                    st.caption(f"Summary length bucket: **{_bucket}**")
+
+                    if _bucket == "short":
+                        _sh = _ed.get("short_summary_relevancy") or {}
+                        _sc1, _sc2 = st.columns(2)
+                        _sc1.metric("BERTScore", _fv("bertscore"),
+                                    help="Semantic token-level F1 (0–1).")
+                        _sc2.metric("Sentence Support", f"{_sh.get('sentence_support', '—'):.3f}" if _sh.get("sentence_support") is not None else "—",
+                                    help="Mean best cosine match per output sentence against source.")
+                        _sc3, _sc4 = st.columns(2)
+                        _sc3.metric("Embedding Cosine", f"{_sh.get('embedding_cosine', '—'):.3f}" if _sh.get("embedding_cosine") is not None else "—",
+                                    help="Dense vector overall meaning alignment (0–1).")
+                        _sc4.metric("Keyphrase Precision", f"{_sh.get('keyphrase_precision', '—'):.3f}" if _sh.get("keyphrase_precision") is not None else "—",
+                                    help="Fraction of output TF-IDF phrases also found in source.")
+                        _sc5, _sc6 = st.columns(2)
+                        _sc5.metric("Keypoint Coverage", f"{_sh.get('capped_keypoint_coverage', '—'):.3f}" if _sh.get("capped_keypoint_coverage") is not None else "—",
+                                    help="Top-N source keyphrases covered by output (capped at 1.0).")
+                        _sc6.metric("ROUGE F1", _fv("rouge"),
+                                    help="avg(ROUGE-1/2/L F1) — light lexical floor signal.")
+                    elif _de_on:
+                        _rc1, _rc2 = st.columns(2)
+                        _rc1.metric("DeepEval Coverage", _fv("deepeval_coverage_clean"),
+                                    help="Fraction of source key-point questions also answered by summary.")
+                        _rc2.metric("Semantic Blend", _fv("semantic_blend"),
+                                    help="0.55×BERTScore + 0.45×ROUGE. Used when DeepEval coverage = 0.")
+                        _rc3, _rc4 = st.columns(2)
+                        _rc3.metric("BERTScore", _fv("bertscore"),
+                                    help="Semantic token-level F1 (0–1).")
+                        _rc4.metric("ROUGE F1", _fv("rouge"),
+                                    help="avg(ROUGE-1/2/L F1).")
+                        _cov_src = _ed.get("coverage_source") or ""
+                        _cov_note = _ed.get("coverage_note") or ""
+                        if _cov_src:
+                            st.caption(f"Coverage source: **{_cov_src}**{' — ' + _cov_note if _cov_note else ''}")
+                        _cov_final = _ed.get("coverage_score")
+                        if _cov_final is not None:
+                            _max_src = "DeepEval" if _ed.get("deepeval_coverage_clean", 0) >= _ed.get("semantic_blend", 0) else "semantic_blend"
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"coverage_score = max(DeepEval, semantic_blend) = <b>{_cov_final:.3f}</b> "
+                                f"→ Relevancy = 5 × {_cov_final:.3f} = <b>{_ed.get('relevancy_0_5', '—'):.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        _lc1, _lc2, _lc3 = st.columns(3)
+                        _lc1.metric("BERTScore", _fv("bertscore"),
+                                    help="Semantic token-level F1 (0–1). Weight: 0.45.")
+                        _lc2.metric("ROUGE F1", _fv("rouge"),
+                                    help="avg(ROUGE-1/2/L F1). Weight: 0.35.")
+                        _lc3.metric("TF-IDF Coverage", "see formula",
+                                    help="Proportion of top TF-IDF reference terms in output. Weight: 0.20.")
+                        _rel_05 = _ed.get("relevancy_0_5")
+                        if _rel_05 is not None:
+                            st.markdown(
+                                f"<span style='font-size:.82rem; opacity:.8;'>"
+                                f"= <b>{_rel_05:.2f} / 5</b></span>",
+                                unsafe_allow_html=True,
+                            )
+
+                    st.divider()
+
+                    # ---- EFFECTIVENESS breakdown ----
+                    st.markdown("##### Effectiveness")
+                    _eff_formula = _ed.get("effectiveness_formula") or ""
+                    if _eff_formula:
+                        st.code(_eff_formula, language="text")
+                    _ew = _ed.get("effectiveness_weights") or {}
+                    _acc_05 = _ed.get("accuracy_0_5")
+                    _rel_05 = _ed.get("relevancy_0_5")
+                    _eff_05 = _ed.get("effectiveness_0_5")
+                    if _acc_05 is not None and _rel_05 is not None and _eff_05 is not None:
+                        _w_acc = _ew.get("accuracy", 0.65)
+                        _w_rel = _ew.get("relevancy", 0.35)
+                        st.markdown(
+                            f"<span style='font-size:.82rem; opacity:.8;'>"
+                            f"= {_w_acc} × {_acc_05:.2f} + {_w_rel} × {_rel_05:.2f} "
+                            f"= <b>{_eff_05:.2f} / 5</b></span>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # DeepEval reason
+                    _de_reason = (_ed.get("deepeval_reason") or "").strip()
+                    if _de_reason:
+                        with st.expander("DeepEval judge reasoning", expanded=False):
+                            st.markdown(_de_reason)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Latency", f"{r.get('Latency_s','N/A')}s")
@@ -1350,6 +2459,16 @@ with t_res:
             or {}
         )
 
+        # Map plain-English metric keys → skipped_signals keys so we can tag
+        # each card as Active or Skipped based on the mode that was used.
+        _pe_to_skipped_key = {
+            "llm_judge":         "llm_as_judge",
+            "faithfulness_source": "independent_vs_source",
+        }
+        _guide_skipped = (
+            (_first_cmp or {}).get("metric_details", {}).get("skipped_signals") or []
+        )
+
         with st.expander(
             "How to read these metrics · plain-English guide",
             expanded=True,
@@ -1357,7 +2476,8 @@ with t_res:
             st.markdown(
                 "Each metric below answers a different question about the "
                 "model's output. **Read this once** — it explains every number "
-                "you'll see in the cards below."
+                "you'll see in the cards below. "
+                "Metrics marked **[Skipped — Fast Mode]** were not computed in this run."
             )
             metric_order = [
                 "overall_score", "winner_and_confidence", "llm_judge",
@@ -1368,13 +2488,27 @@ with t_res:
                 m = _plain_english.get(key)
                 if not m:
                     continue
+                _sk = _pe_to_skipped_key.get(key)
+                _was_skipped = _sk and _sk in _guide_skipped
+                _status_badge = (
+                    "<span style='font-size:.72rem; padding:2px 7px; border-radius:10px; "
+                    "background:rgba(99,102,241,.15); color:#a5b4fc; margin-left:.5rem;'>"
+                    "Skipped — Fast Mode</span>"
+                    if _was_skipped else
+                    "<span style='font-size:.72rem; padding:2px 7px; border-radius:10px; "
+                    "background:rgba(34,197,94,.12); color:#86efac; margin-left:.5rem;'>"
+                    "Active</span>"
+                )
+                _border_color = "rgba(99,102,241,.25)" if _was_skipped else "rgba(99,102,241,.55)"
+                _bg_color     = "rgba(99,102,241,.02)" if _was_skipped else "rgba(99,102,241,.04)"
+                _opacity      = ".55" if _was_skipped else ".92"
                 st.markdown(
                     f"""
-<div style="border-left:3px solid rgba(99,102,241,.55);
+<div style="border-left:3px solid {_border_color};
             padding:8px 12px; margin:8px 0;
-            background:rgba(99,102,241,.04); border-radius:6px;">
-  <div style="font-weight:700; margin-bottom:.25rem;">{m['label']}</div>
-  <div style="font-size:.88rem; line-height:1.55; opacity:.92;">
+            background:{_bg_color}; border-radius:6px;">
+  <div style="font-weight:700; margin-bottom:.25rem;">{m['label']}{_status_badge}</div>
+  <div style="font-size:.88rem; line-height:1.55; opacity:{_opacity};">
     <b>What it measures:</b> {m['what']}<br>
     <b>How it's computed:</b> {m['how']}<br>
     <b>What a good score looks like:</b> {m['good']}<br>
@@ -1473,6 +2607,29 @@ with t_res:
                 else:
                     st.info("Overall Score unavailable — judge or NLI did not run.")
 
+                # ---- Skipped-signals notice (inline, per model) ----------
+                _cmp_skipped = ((cmp.get("metric_details") or {}).get("skipped_signals") or [])
+                _cmp_depth   = cmp.get("comparison_depth", "Fast")
+                if _cmp_skipped:
+                    _skip_labels = {
+                        "deepeval_alignment":   "DeepEval pair alignment",
+                        "independent_vs_source":"Source faithfulness scoring",
+                        "llm_as_judge":         "LLM-as-Judge",
+                    }
+                    _skip_pretty = ", ".join(
+                        _skip_labels.get(s, s) for s in _cmp_skipped
+                    )
+                    st.markdown(
+                        f"<div style='font-size:.82rem; opacity:.8; "
+                        f"padding:6px 10px; border-radius:7px; margin:4px 0 8px 0; "
+                        f"background:rgba(99,102,241,.08); "
+                        f"border:1px solid rgba(99,102,241,.2);'>"
+                        f"⚡ <b>Fast Mode</b> — skipped: {_skip_pretty}. "
+                        f"<span style='opacity:.7;'>Switch to Full Audit to enable all signals.</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
                 # ---- Tier 2: LLM-as-Judge headline metric ---------------
                 judge = cmp.get("llm_judge")
                 judge_0_1 = cmp.get("judge_score_0_1")
@@ -1486,8 +2643,13 @@ with t_res:
                              "via A/B swap. The single highest-signal metric.",
                     )
                 else:
-                    top1.metric("LLM-as-Judge", "—",
-                                help="Judge not run or returned an error.")
+                    _judge_help = (
+                        "Skipped — LLM-as-Judge only runs in Full Audit mode. "
+                        "Switch the comparison depth to Full Audit to enable it."
+                        if "llm_as_judge" in _cmp_skipped
+                        else "LLM judge did not run or returned an error."
+                    )
+                    top1.metric("LLM-as-Judge", "—", help=_judge_help)
                 top2.metric(
                     "Factual Consistency",
                     _fmt_num(cmp.get("factual_score_0_1")),
@@ -1518,8 +2680,13 @@ with t_res:
                              "Catches hallucinations the reference comparison misses.",
                     )
                 else:
-                    sup2.metric("Faithfulness · Source", "—",
-                                help="No source document provided for this run.")
+                    _src_help = (
+                        "Skipped — source faithfulness scoring only runs in Full Audit mode. "
+                        "Switch the comparison depth to Full Audit to enable it."
+                        if "independent_vs_source" in _cmp_skipped
+                        else "No source document provided, or source scoring was unavailable."
+                    )
+                    sup2.metric("Faithfulness · Source", "—", help=_src_help)
 
                 # ---- LLM-as-Judge rationale + hallucinations ------------
                 if judge and "error" not in judge:
@@ -1604,14 +2771,20 @@ with t_res:
                 overall_weights = cmp.get("overall_weights") or {}
                 overall_score = cmp.get("overall_score_100")
                 if metric_details or overall_components:
+                    _expand_score = (_cmp_depth == "Full audit")
                     with st.expander(
                         "How the Overall Score was built · step-by-step with this run's numbers",
-                        expanded=False,
+                        expanded=_expand_score,
                     ):
+                        _mode_note = (
+                            "Full Audit mode — all four signals (LLM-as-Judge, Factual, Semantic, Length) contributed."
+                            if _cmp_depth == "Full audit"
+                            else "Fast mode — only the signals that ran contributed; weights renormalized."
+                        )
                         st.markdown(
                             "Below is the **exact math** that produced this "
                             "model's Overall Score. Every number you see here "
-                            "comes from this run."
+                            f"comes from this run. *{_mode_note}*"
                         )
 
                         if overall_components:
@@ -1962,14 +3135,55 @@ with t_res:
 # TAB: Dashboard
 # ===========================================================================
 with t_dash:
-    html = st.session_state.dashboard_html
-    if not html:
-        st.info("Run an experiment to generate the rich HTML dashboard.")
+    _dash_res  = st.session_state.results
+    _dash_html = st.session_state.dashboard_html
+
+    if not _dash_res and not _dash_html:
+        st.info("Run an experiment to generate the dashboard.")
         st.stop()
-    section_header("HTML Dashboard", "Standalone interactive dashboard generated from the latest experiment.")
-    st.download_button(
-        "Download Dashboard HTML",
-        html, file_name="ab_dashboard.html", mime="text/html",
-        use_container_width=True,
-    )
-    st.components.v1.html(html, height=920, scrolling=True)
+
+    # ── Evaluation metric components & formulas (native Streamlit) ─────────
+    if _dash_res:
+        section_header(
+            "Evaluation Metric Components & Formulas",
+            "All sub-scores, formulas, and signal weights used to compute every "
+            "metric in this run — identical to the Results tab.",
+        )
+        _render_metric_section(_dash_res)
+
+        # Download results JSON from the Dashboard tab too
+        jp = st.session_state.last_json_path
+        if jp and os.path.exists(jp):
+            with open(jp, "rb") as _f:
+                st.download_button(
+                    "Download Results JSON",
+                    _f.read(),
+                    file_name=os.path.basename(jp),
+                    mime="application/json",
+                    use_container_width=True,
+                    key="dash_download_json",
+                )
+
+    # ── HTML Dashboard (iframe) ─────────────────────────────────────────────
+    if _dash_html:
+        _dash_ts = (_dash_res or [{}])[0].get("Timestamp", "—")
+        section_header(
+            "Interactive HTML Dashboard",
+            "Standalone interactive dashboard generated from the latest experiment. "
+            "Download it to open in any browser without Streamlit.",
+        )
+        st.caption(
+            f"Rendered from run `{_dash_ts}`. Each run saves a NEW timestamped file "
+            "in the `output/` folder — if a separately opened `.html` looks stale, "
+            "download a fresh copy using the button below."
+        )
+        st.download_button(
+            "Download Dashboard HTML",
+            _dash_html,
+            file_name=f"ab_dashboard_{_dash_ts}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+        # Force iframe remount each run so it never shows a stale render.
+        with st.container(key=f"dash_html_{_dash_ts}"):
+            st.components.v1.html(_dash_html, height=1100, scrolling=True)
